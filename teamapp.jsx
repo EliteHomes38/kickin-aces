@@ -8,7 +8,12 @@ const SUPABASE_URL = "https://gujmmtjyinvpsqdgrrfz.supabase.co";
 const SUPABASE_ANON = "sb_publishable_O1rQlZgl5AQ7nlRBFHC19Q_p5xcQ5fX";
 const TEAM_ID = "00000000-0000-0000-0000-000000000001";
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON);
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON, {
+  auth: {
+    detectSessionInUrl: true,
+    flowType: 'pkce',
+  }
+});
 
 // ============================================================
 // THEME
@@ -34,16 +39,30 @@ export default function App() {
       setLoading(false);
       return;
     }
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session);
-      if (data.session) loadProfile(data.session.user.id);
-      else setLoading(false);
-    });
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, sess) => {
+
+    // Set up auth listener FIRST — this handles OAuth callbacks,
+    // session refresh, sign-in, sign-out, and initial session
+    const { data: sub } = supabase.auth.onAuthStateChange((event, sess) => {
       setSession(sess);
       if (sess) loadProfile(sess.user.id);
-      else { setProfile(null); setLoading(false); }
+      else if (event === 'INITIAL_SESSION' || event === 'SIGNED_OUT') {
+        setProfile(null);
+        setLoading(false);
+      }
     });
+
+    // Also check for existing session (catches already-authenticated users)
+    supabase.auth.getSession().then(({ data }) => {
+      if (data.session) {
+        setSession(data.session);
+        loadProfile(data.session.user.id);
+      } else {
+        // Only stop loading if there's no OAuth code pending in the URL
+        const hasCode = params.get('code') || window.location.hash.includes('access_token');
+        if (!hasCode) setLoading(false);
+      }
+    });
+
     return () => sub.subscription.unsubscribe();
   }, []);
 
@@ -51,14 +70,24 @@ export default function App() {
     const { data } = await supabase.from("profiles").select("*").eq("id", userId).single();
     if (!data) {
       const user = (await supabase.auth.getUser()).data.user;
-      const { data: created } = await supabase.from("profiles").insert({
+      const meta = user?.user_metadata || {};
+      // Google OAuth uses 'name' or 'full_name'; email signup uses 'full_name'
+      const fullName = meta.full_name || meta.name || meta.user_name || user?.email?.split("@")[0] || "Player";
+      const role = meta.role || "player";
+      const { data: created, error } = await supabase.from("profiles").insert({
         id: userId,
         email: user?.email,
-        full_name: user?.user_metadata?.full_name || user?.email?.split("@")[0],
-        role: user?.user_metadata?.role || "player",
+        full_name: fullName,
+        role,
       }).select().single();
-      setProfile(created);
-      await supabase.from("team_members").insert({ team_id: TEAM_ID, profile_id: userId, role: created?.role || "player" });
+      if (created) {
+        setProfile(created);
+        await supabase.from("team_members").insert({ team_id: TEAM_ID, profile_id: userId, role: created.role || "player" }).catch(() => {});
+      } else {
+        // Profile insert might fail if RLS blocks it — still set a basic profile so user isn't stuck
+        console.warn("Profile creation error:", error);
+        setProfile({ id: userId, email: user?.email, full_name: fullName, role });
+      }
     } else {
       setProfile(data);
     }
